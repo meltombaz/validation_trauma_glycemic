@@ -10,8 +10,10 @@
 #   final_reduced_model_Male.pkl
 # ============================================================
 
+import io
 import os
 import joblib
+import openpyxl
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -515,6 +517,282 @@ def predict(artifact, X_row):
 
 
 # ============================================================
+# BATCH UPLOAD (Excel database)
+#
+# Reads the "Datentabelle" sheet of the HbA1c database file (one
+# column per patient, one row per questionnaire/lab variable) and
+# scores every complete patient using the exact same predict()
+# pipeline as the single-patient form above.
+# ============================================================
+
+BATCH_ROW = {
+    "survey_date": 3,
+    "birth_date": 5,
+    "age_calc": 6,               # =DATEDIF(birth, survey, "Y")
+    "sex": 7,                    # 'weiblich' / 'männlich' / 'divers'
+    "height_m": 11,               # in meters
+    "weight_kg": 12,
+    "bmi_calc": 13,               # =weight / height^2
+    "waist_cm": 14,               # Taillenumfang
+    "bp_medicine": 18,            # Blutdruckmedikamente jemals verordnet?
+    "high_blood_sugar": 19,       # Jemals zu hohe Blutzuckerwerte festgestellt?
+    "leukocytes": 83,             # Leukozyten, 1/µL
+    "mchc": 88,                   # g/dL
+    "quick": 94,                  # %
+    "aptt": 96,                   # sec
+    "mean_platelet_volume": 93,   # mittleres Plättchenvolumen, fL
+}
+BATCH_STUDENT_ID_ROW = 2
+BATCH_FIRST_PATIENT_COL = 8   # column H — column G holds the 'Hexxx' template label
+BATCH_PLACEHOLDER_VALUES = {None, "", "bitte auswählen", "Hexxx", "keine Angabe notwendig"}
+BATCH_YES_NO_MAP = {"ja": 2, "nein": 0}
+BATCH_SEX_MODEL_MAP = {"weiblich": "Female", "männlich": "Male"}
+
+
+def batch_is_missing(value):
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() in BATCH_PLACEHOLDER_VALUES:
+        return True
+    return False
+
+
+def batch_find_patient_columns(ws):
+    cols = []
+    for c in range(BATCH_FIRST_PATIENT_COL, ws.max_column + 1):
+        sid = ws.cell(row=BATCH_STUDENT_ID_ROW, column=c).value
+        if sid and str(sid).strip() not in BATCH_PLACEHOLDER_VALUES:
+            cols.append((c, str(sid).strip()))
+    return cols
+
+
+def batch_extract_patient(ws, col):
+    """Pull one patient's column out of the Datentabelle sheet and
+    translate it into the model's feature names. Returns
+    (features_dict, sex_label, problems)."""
+
+    problems = []
+
+    def cell(row_key):
+        return ws.cell(row=BATCH_ROW[row_key], column=col).value
+
+    sex_raw = cell("sex")
+    if batch_is_missing(sex_raw):
+        problems.append("Sex ('Geschlecht') is missing.")
+        sex_label = None
+    else:
+        sex_label = BATCH_SEX_MODEL_MAP.get(str(sex_raw).strip().lower())
+        if sex_label is None:
+            problems.append(
+                f"Sex value '{sex_raw}' is not 'weiblich'/'männlich' — "
+                "no matching sex-specific model."
+            )
+
+    age = cell("age_calc")
+    if batch_is_missing(age) or not isinstance(age, (int, float)):
+        birth = cell("birth_date")
+        survey = cell("survey_date")
+        if hasattr(birth, "year") and hasattr(survey, "year"):
+            age = survey.year - birth.year - (
+                (survey.month, survey.day) < (birth.month, birth.day)
+            )
+        else:
+            problems.append("Age could not be determined (missing birth/survey date).")
+            age = None
+
+    bmi = cell("bmi_calc")
+    if batch_is_missing(bmi) or isinstance(bmi, str):
+        weight = cell("weight_kg")
+        height_m = cell("height_m")
+        if isinstance(weight, (int, float)) and isinstance(height_m, (int, float)) and height_m > 0:
+            bmi = weight / (height_m ** 2)
+        else:
+            problems.append("BMI could not be computed (missing weight/height).")
+            bmi = None
+
+    numeric_fields = {
+        "WaistCircumference": "waist_cm",
+        "LEU": "leukocytes",
+        "MCHC": "mchc",
+        "QUICK": "quick",
+        "APTT": "aptt",
+        "MeanPlateletVolume": "mean_platelet_volume",
+    }
+
+    features = {"Age": age, "BMI": bmi}
+
+    for feat_name, row_key in numeric_fields.items():
+        value = cell(row_key)
+        if batch_is_missing(value) or not isinstance(value, (int, float)):
+            problems.append(f"{field_label_no_unit(feat_name)} is missing or non-numeric.")
+            features[feat_name] = None
+        else:
+            features[feat_name] = float(value)
+
+    yes_no_fields = {
+        "Previous High Blood Sugar Levels": "high_blood_sugar",
+        "High Blood Pressure Medicine": "bp_medicine",
+    }
+
+    for feat_name, row_key in yes_no_fields.items():
+        value = cell(row_key)
+        if batch_is_missing(value):
+            problems.append(f"{field_label_no_unit(feat_name)} is missing.")
+            features[feat_name] = None
+        else:
+            key = str(value).strip().lower()
+            if key not in BATCH_YES_NO_MAP:
+                problems.append(f"{field_label_no_unit(feat_name)} value '{value}' is not 'ja'/'nein'.")
+                features[feat_name] = None
+            else:
+                features[feat_name] = BATCH_YES_NO_MAP[key]
+
+    return features, sex_label, problems
+
+
+def run_batch(workbook_bytes, threshold):
+    """Score every patient column found in the uploaded workbook.
+    Returns a results DataFrame (one row per patient column)."""
+
+    wb = openpyxl.load_workbook(io.BytesIO(workbook_bytes), data_only=True)
+
+    if "Datentabelle" not in wb.sheetnames:
+        return None, "No 'Datentabelle' sheet found in the uploaded file."
+
+    ws = wb["Datentabelle"]
+    patient_cols = batch_find_patient_columns(ws)
+
+    if not patient_cols:
+        return pd.DataFrame(), None
+
+    artifacts = {}
+    results = []
+
+    for col, student_id in patient_cols:
+        features, sex_label, problems = batch_extract_patient(ws, col)
+
+        row = {
+            "Student-ID": student_id,
+            "Sex": sex_label or "?",
+            "Status": "OK" if not problems and sex_label else "Incomplete",
+            "Probability": None,
+            "Classification": None,
+            "Issues": "; ".join(problems),
+        }
+
+        if row["Status"] == "OK":
+            model_path = MODEL_PATHS[sex_label]
+            if not os.path.exists(model_path):
+                row["Status"] = "Incomplete"
+                row["Issues"] = f"Model file not found: {model_path}"
+            else:
+                if sex_label not in artifacts:
+                    artifacts[sex_label] = load_artifact(model_path)
+
+                artifact = artifacts[sex_label]
+                X_row = pd.DataFrame([features])[artifact["feature_names"]]
+                probability = predict(artifact, X_row)
+                row["Probability"] = round(probability, 4)
+                row["Classification"] = (
+                    "Pre-diabetes / Diabetes risk"
+                    if probability >= threshold else "Normal"
+                )
+
+        results.append(row)
+
+    return pd.DataFrame(results), None
+
+
+def to_excel_bytes(df):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Predictions", index=False)
+    return buffer.getvalue()
+
+
+def render_batch_tab():
+
+    st.markdown(
+        '<div class="section-heading">Upload patient database</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "Upload the HbA1c database Excel file (\u201cDatentabelle\u201d sheet). "
+        "Each patient column is scored with the same sex-specific model "
+        "used in the single-patient form."
+    )
+
+    threshold = st.slider(
+        "Decision threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.50,
+        step=0.01,
+        key="batch_threshold",
+        help=(
+            "Probability threshold used to convert each patient's "
+            "model probability into a binary classification."
+        ),
+    )
+
+    uploaded = st.file_uploader(
+        "Excel database (.xlsx)",
+        type=["xlsx"],
+        key="batch_uploader",
+    )
+
+    if uploaded is None:
+        return
+
+    results_df, error = run_batch(uploaded.getvalue(), threshold)
+
+    if error:
+        st.error(error)
+        return
+
+    if results_df.empty:
+        st.warning("No patient columns were found in the uploaded file.")
+        return
+
+    ok_count = int((results_df["Status"] == "OK").sum())
+    total = len(results_df)
+
+    st.write("")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Patients scored", f"{ok_count} / {total}")
+    with c2:
+        if ok_count:
+            flagged = int(
+                (results_df["Classification"] == "Pre-diabetes / Diabetes risk").sum()
+            )
+            st.metric("Above threshold", flagged)
+
+    st.write("")
+    st.dataframe(
+        results_df,
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    incomplete = total - ok_count
+    if incomplete:
+        st.caption(
+            f"{incomplete} patient column(s) were skipped — see the "
+            "\u201cIssues\u201d column for what's missing or unreadable."
+        )
+
+    st.download_button(
+        "Download results (.xlsx)",
+        data=to_excel_bytes(results_df),
+        file_name="predictions.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+
+# ============================================================
 # VALIDATION HELPERS
 #
 # Plain st.number_input silently clamps out-of-range typed values to
@@ -965,40 +1243,7 @@ def render_result(
 # MAIN APP
 # ============================================================
 
-def main():
-
-    # --------------------------------------------------------
-    # Header
-    # --------------------------------------------------------
-
-    st.html("""
-    <div class="app-header">
-
-        <div class="header-top">
-            <div>
-                <div class="app-title">
-                    Glycemic Risk Screening
-                </div>
-
-                <div class="app-subtitle">
-                    Sex-specific machine-learning screening for
-                    prediabetes and diabetes risk in trauma patients
-                </div>
-            </div>
-
-            <div class="research-badge">
-                RESEARCH USE ONLY
-            </div>
-        </div>
-
-        <div class="disclaimer">
-            <span class="disclaimer-dot"></span>
-            Internal validation tool \u00b7 Not a clinical diagnostic device \u00b7
-            Model predictions do not replace HbA1c testing or clinical assessment
-        </div>
-
-    </div>
-    """)
+def render_single_patient_tab():
 
     # --------------------------------------------------------
     # Sex selection
@@ -1254,6 +1499,52 @@ def main():
                 hide_index=True,
                 use_container_width=True,
             )
+
+
+def main():
+
+    # --------------------------------------------------------
+    # Header
+    # --------------------------------------------------------
+
+    st.html("""
+    <div class="app-header">
+
+        <div class="header-top">
+            <div>
+                <div class="app-title">
+                    Glycemic Risk Screening
+                </div>
+
+                <div class="app-subtitle">
+                    Sex-specific machine-learning screening for
+                    prediabetes and diabetes risk in trauma patients
+                </div>
+            </div>
+
+            <div class="research-badge">
+                RESEARCH USE ONLY
+            </div>
+        </div>
+
+        <div class="disclaimer">
+            <span class="disclaimer-dot"></span>
+            Internal validation tool \u00b7 Not a clinical diagnostic device \u00b7
+            Model predictions do not replace HbA1c testing or clinical assessment
+        </div>
+
+    </div>
+    """)
+
+    tab_single, tab_batch = st.tabs(
+        ["\U0001f9cd Single patient", "\U0001f4cb Batch upload (Excel)"]
+    )
+
+    with tab_single:
+        render_single_patient_tab()
+
+    with tab_batch:
+        render_batch_tab()
 
 
 if __name__ == "__main__":
