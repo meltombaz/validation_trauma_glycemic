@@ -566,9 +566,11 @@ def batch_find_patient_columns(ws):
     return cols
 
 
-def batch_extract_patient(ws, col):
+def batch_extract_patient(ws, col, required_features):
     """Pull one patient's column out of the Datentabelle sheet and
-    translate it into the model's feature names. Returns
+    translate it into the model's feature names. Only reads/validates
+    fields in `required_features` — a field a given sex's model
+    doesn't use is never flagged as missing. Returns
     (features_dict, sex_label, problems)."""
 
     problems = []
@@ -588,27 +590,33 @@ def batch_extract_patient(ws, col):
                 "no matching sex-specific model."
             )
 
-    age = cell("age_calc")
-    if batch_is_missing(age) or not isinstance(age, (int, float)):
-        birth = cell("birth_date")
-        survey = cell("survey_date")
-        if hasattr(birth, "year") and hasattr(survey, "year"):
-            age = survey.year - birth.year - (
-                (survey.month, survey.day) < (birth.month, birth.day)
-            )
-        else:
-            problems.append("Age could not be determined (missing birth/survey date).")
-            age = None
+    features = {}
 
-    bmi = cell("bmi_calc")
-    if batch_is_missing(bmi) or isinstance(bmi, str):
-        weight = cell("weight_kg")
-        height_m = cell("height_m")
-        if isinstance(weight, (int, float)) and isinstance(height_m, (int, float)) and height_m > 0:
-            bmi = weight / (height_m ** 2)
-        else:
-            problems.append("BMI could not be computed (missing weight/height).")
-            bmi = None
+    if "Age" in required_features:
+        age = cell("age_calc")
+        if batch_is_missing(age) or not isinstance(age, (int, float)):
+            birth = cell("birth_date")
+            survey = cell("survey_date")
+            if hasattr(birth, "year") and hasattr(survey, "year"):
+                age = survey.year - birth.year - (
+                    (survey.month, survey.day) < (birth.month, birth.day)
+                )
+            else:
+                problems.append("Age could not be determined (missing birth/survey date).")
+                age = None
+        features["Age"] = age
+
+    if "BMI" in required_features:
+        bmi = cell("bmi_calc")
+        if batch_is_missing(bmi) or isinstance(bmi, str):
+            weight = cell("weight_kg")
+            height_m = cell("height_m")
+            if isinstance(weight, (int, float)) and isinstance(height_m, (int, float)) and height_m > 0:
+                bmi = weight / (height_m ** 2)
+            else:
+                problems.append("BMI could not be computed (missing weight/height).")
+                bmi = None
+        features["BMI"] = bmi
 
     numeric_fields = {
         "WaistCircumference": "waist_cm",
@@ -619,9 +627,9 @@ def batch_extract_patient(ws, col):
         "MeanPlateletVolume": "mean_platelet_volume",
     }
 
-    features = {"Age": age, "BMI": bmi}
-
     for feat_name, row_key in numeric_fields.items():
+        if feat_name not in required_features:
+            continue
         value = cell(row_key)
         if batch_is_missing(value) or not isinstance(value, (int, float)):
             problems.append(f"{field_label_no_unit(feat_name)} is missing or non-numeric.")
@@ -635,6 +643,8 @@ def batch_extract_patient(ws, col):
     }
 
     for feat_name, row_key in yes_no_fields.items():
+        if feat_name not in required_features:
+            continue
         value = cell(row_key)
         if batch_is_missing(value):
             problems.append(f"{field_label_no_unit(feat_name)} is missing.")
@@ -669,34 +679,63 @@ def run_batch(workbook_bytes, threshold):
     results = []
 
     for col, student_id in patient_cols:
-        features, sex_label, problems = batch_extract_patient(ws, col)
+
+        # Sex has to be known first: it decides which model — and
+        # therefore which features — this patient is even checked against.
+        sex_raw = ws.cell(row=BATCH_ROW["sex"], column=col).value
+        if batch_is_missing(sex_raw):
+            results.append({
+                "Student-ID": student_id, "Sex": "?", "Status": "Incomplete",
+                "Probability": None, "Classification": None,
+                "Issues": "Sex ('Geschlecht') is missing.",
+            })
+            continue
+
+        sex_label = BATCH_SEX_MODEL_MAP.get(str(sex_raw).strip().lower())
+        if sex_label is None:
+            results.append({
+                "Student-ID": student_id, "Sex": "?", "Status": "Incomplete",
+                "Probability": None, "Classification": None,
+                "Issues": (
+                    f"Sex value '{sex_raw}' is not 'weiblich'/'männlich' — "
+                    "no matching sex-specific model."
+                ),
+            })
+            continue
+
+        model_path = MODEL_PATHS[sex_label]
+        if not os.path.exists(model_path):
+            results.append({
+                "Student-ID": student_id, "Sex": sex_label, "Status": "Incomplete",
+                "Probability": None, "Classification": None,
+                "Issues": f"Model file not found: {model_path}",
+            })
+            continue
+
+        if sex_label not in artifacts:
+            artifacts[sex_label] = load_artifact(model_path)
+        artifact = artifacts[sex_label]
+        required_features = set(artifact["feature_names"])
+
+        features, _, problems = batch_extract_patient(ws, col, required_features)
 
         row = {
             "Student-ID": student_id,
-            "Sex": sex_label or "?",
-            "Status": "OK" if not problems and sex_label else "Incomplete",
+            "Sex": sex_label,
+            "Status": "OK" if not problems else "Incomplete",
             "Probability": None,
             "Classification": None,
             "Issues": "; ".join(problems),
         }
 
         if row["Status"] == "OK":
-            model_path = MODEL_PATHS[sex_label]
-            if not os.path.exists(model_path):
-                row["Status"] = "Incomplete"
-                row["Issues"] = f"Model file not found: {model_path}"
-            else:
-                if sex_label not in artifacts:
-                    artifacts[sex_label] = load_artifact(model_path)
-
-                artifact = artifacts[sex_label]
-                X_row = pd.DataFrame([features])[artifact["feature_names"]]
-                probability = predict(artifact, X_row)
-                row["Probability"] = round(probability, 4)
-                row["Classification"] = (
-                    "Pre-diabetes / Diabetes risk"
-                    if probability >= threshold else "Normal"
-                )
+            X_row = pd.DataFrame([features])[artifact["feature_names"]]
+            probability = predict(artifact, X_row)
+            row["Probability"] = round(probability, 4)
+            row["Classification"] = (
+                "Pre-diabetes / Diabetes risk"
+                if probability >= threshold else "Normal"
+            )
 
         results.append(row)
 
